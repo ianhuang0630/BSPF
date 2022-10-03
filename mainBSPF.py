@@ -37,8 +37,6 @@ FLAGS = parser.parse_args()
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]=FLAGS.gpu
 
-import ipdb; ipdb.set_trace()
-
 if not os.path.exists(FLAGS.sample_dir):
 	os.makedirs(FLAGS.sample_dir)
 
@@ -46,7 +44,7 @@ if FLAGS.ae:
 	bsp_ae = BSP_AE(FLAGS)
 
 	if FLAGS.train:
-		bsp_ae.train(FLAGS)
+		bsp_ae.train_BSPF(FLAGS)
 	elif FLAGS.getz:
 		bsp_ae.get_z(FLAGS)
 	else:

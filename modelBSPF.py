@@ -3,6 +3,7 @@ import time
 import math
 import random
 import numpy as np
+np.random.seed(7000)
 import h5py
 
 import torch
@@ -14,6 +15,7 @@ from torch.autograd import Variable
 
 import mcubes
 from bspt import digest_bsp, get_mesh, get_mesh_watertight
+from BSPF import bspf_network
 #from bspt_slow import digest_bsp, get_mesh, get_mesh_watertight
 
 from utils import *
@@ -183,6 +185,14 @@ class bsp_network(nn.Module):
         return z_vector, plane_m, net_out_convexes, net_out
 
 
+def retain_airplanes(category_id, model_id):
+    return (category_id == '02691156') # from https://gist.github.com/tejaskhot/15ae62827d6e43b91a4b0c5c850c168e
+
+def get_airplanes_targets(indices):
+    target_indices = indices.copy() 
+    random.shuffle(target_indices)
+    return target_indices
+
 class BSP_AE(object):
     def __init__(self, config):
         """
@@ -211,17 +221,16 @@ class BSP_AE(object):
         self.c_dim = 256
 
         self.dataset_name = config.dataset
-        self.dataset_load = self.dataset_name + '_train'
+        self.dataset_load = self.dataset_name + '_test' # '_train'
         if not (config.train or config.getz):
             self.dataset_load = self.dataset_name + '_test'
         self.checkpoint_dir = config.checkpoint_dir
         self.data_dir = config.data_dir
     
-
-        # TODO: get the id's
+        # get the id's
         dataid_name = self.data_dir +'/'+self.dataset_load+'.txt'
         with open(dataid_name, 'r') as f:
-            data_lines = f.readlines()
+            data_id = [ el.strip().split('/') for el in f.readlines()]
 
         data_hdf5_name = self.data_dir+'/'+self.dataset_load+'.hdf5'
         if os.path.exists(data_hdf5_name):
@@ -235,7 +244,16 @@ class BSP_AE(object):
         else:
             print("error: cannot load "+data_hdf5_name)
             exit(0)
-        
+
+        # generate pairs
+        src_idx = [ idx for idx in range(len(data_id)) if retain_airplanes(*data_id[idx])] 
+        tgt_idx = get_airplanes_targets(src_idx)
+        first_k = 24 
+        if first_k is not None:
+            self.src_tgt = list(zip(src_idx[:first_k], tgt_idx[:first_k]))
+        else: 
+            self.src_tgt = list(zip(src_idx, tgt_idx))
+
         self.real_size = 64 #output point-value voxel grid size in testing
         self.test_size = 32 #related to testing batch_size, adjust according to gpu memory size
         test_point_batch_size = self.test_size*self.test_size*self.test_size #do not change
@@ -277,10 +295,17 @@ class BSP_AE(object):
         #build model
         self.bsp_network = bsp_network(self.phase, self.ef_dim, self.p_dim, self.c_dim)
         self.bsp_network.to(self.device)
+
+        #bspflow_network
+        self.bspf_network = bspf_network(self.ef_dim*8, self.p_dim)
+        self.bspf_network.to(self.device)
+
         #print params
         #for param_tensor in self.bsp_network.state_dict():
         #   print(param_tensor, "\t", self.bsp_network.state_dict()[param_tensor].size())
         self.optimizer = torch.optim.Adam(self.bsp_network.parameters(), lr=config.learning_rate, betas=(config.beta1, 0.999))
+        self.bspf_optimizer = torch.optim.Adam(self.bspf_network.parameters(), lr=config.learning_rate, betas=(config.beta1, 0.999))
+
         #pytorch does not have a checkpoint manager
         #have to define it myself to manage max num of checkpoints to keep
         self.max_to_keep = 2
@@ -381,6 +406,94 @@ class BSP_AE(object):
                 fout.write(self.checkpoint_manager_list[pointer]+"\n")
         fout.close()
 
+    def train_BSPF(self, config):
+        self.load() # loading the  parameters for the BSP network.
+        shape_num = len(self.src_tgt)
+        print("\n\n----------net summary----------")
+        print("training samples   ", shape_num)
+        print("-------------------------------\n\n")
+        
+        start_time = time.time()
+        assert config.epoch==0 or config.iteration==0
+        training_epoch = config.epoch + int(config.iteration/shape_num)
+        batch_num = int(shape_num/self.shape_batch_size)
+        point_batch_num = int(self.load_point_batch_size/self.point_batch_size)
+
+        self.bsp_network.eval() # NOTE switch to test?
+        self.bspf_network.train()
+
+        for epoch in range(0, training_epoch):
+            avg_loss_sp = 0
+            avg_loss_tt = 0
+            avg_num = 0
+            for idx in range(batch_num):
+                src_tgt = self.src_tgt[idx*self.shape_batch_size:(idx+1)*self.shape_batch_size]
+                src_idx = [el[0] for el in src_tgt] 
+                tgt_idx = [el[1] for el in src_tgt]
+                src_batch_voxels = self.data_voxels[src_idx].astype(np.float32)
+                tgt_batch_voxels = self.data_voxels[tgt_idx].astype(np.float32) 
+                            
+                if point_batch_num==1:
+                    src_point_coord = self.data_points[src_idx]
+                    tgt_point_coord = self.data_points[tgt_idx]
+                    src_point_value = self.data_values[src_idx]
+                    tgt_point_value = self.data_values[tgt_idx]
+                else:
+                    which_batch = np.random.randint(point_batch_num)
+                    print(f'point batch index: {which_batch}')
+                    src_point_coord = self.data_points[src_idx,which_batch*self.point_batch_size:(which_batch+1)*self.point_batch_size]
+                    src_point_value = self.data_values[src_idx,which_batch*self.point_batch_size:(which_batch+1)*self.point_batch_size]
+                    tgt_point_coord = self.data_points[tgt_idx,which_batch*self.point_batch_size:(which_batch+1)*self.point_batch_size]
+                    tgt_point_value = self.data_values[tgt_idx,which_batch*self.point_batch_size:(which_batch+1)*self.point_batch_size]
+
+                # source inputs
+                src_batch_voxels = torch.from_numpy(src_batch_voxels)
+                src_point_coord = torch.from_numpy(src_point_coord)
+                src_point_value = torch.from_numpy(src_point_value)
+                src_batch_voxels = src_batch_voxels.to(self.device)
+                src_point_coord = src_point_coord.to(self.device)
+                src_point_value = src_point_value.to(self.device)
+
+                # target inputs
+                tgt_batch_voxels = torch.from_numpy(tgt_batch_voxels)
+                tgt_point_coord = torch.from_numpy(tgt_point_coord)
+                tgt_point_value = torch.from_numpy(tgt_point_value)
+                tgt_batch_voxels = tgt_batch_voxels.to(self.device)
+                tgt_point_coord = tgt_point_coord.to(self.device)
+                tgt_point_value = tgt_point_value.to(self.device)
+                
+                # NOTE: pretrained bsp network entirely frozen 
+                with torch.no_grad():
+                    # NOTE: for source, querying the tgt point coordinates. This should affect net_out_convexes and net_out, but not src_latent and src_planes.
+                    src_latent, src_planes, src_net_out_convexes, src_net_out = self.bsp_network(src_batch_voxels, None, None, tgt_point_coord, is_training=False) # NOTE is_training = TRUE?
+                    tgt_latent, tgt_planes, tgt_net_out_convexes, tgt_net_out = self.bsp_network(tgt_batch_voxels, None, None, tgt_point_coord, is_training=False)  
+
+                pred_planes = self.bspf_network(tgt_latent, src_latent, src_planes)
+                _, _, flowed_net_out_convexes, flowed_net_out = self.bsp_network(None, None, pred_planes, tgt_point_coord, convex_mask=None, is_training=False)
+                # NOTE; by default, this is phase=1 loss function (hard discretization, L_recon)
+                errSP, errTT = self.loss(flowed_net_out_convexes, flowed_net_out, tgt_point_value, self.bsp_network.generator.convex_layer_weights, self.bsp_network.generator.concave_layer_weights)
+                with torch.no_grad():
+                    tgt_errSP, tgt_errTT = self.loss(tgt_net_out_convexes, tgt_net_out, tgt_point_value, self.bsp_network.generator.convex_layer_weights, self.bsp_network.generator.concave_layer_weights)
+                    src_errSP, src_errTT = self.loss(src_net_out_convexes, src_net_out, tgt_point_value, self.bsp_network.generator.convex_layer_weights, self.bsp_network.generator.concave_layer_weights)
+                print(f'loss: {errTT.detach().item()}     src_ref: {src_errTT.detach().item()}      tgt_ref: {tgt_errTT.detach().item()}')
+                self.bsp_network.zero_grad()
+                self.bspf_network.zero_grad()
+                errTT.backward() # NOTE gradients also calculated for the generator. this is slower, and useless.
+                self.bspf_optimizer.step()  # NOTE: we only take the step in bspf
+
+                avg_loss_sp += errSP.item()
+                avg_loss_tt += errTT.item()
+                avg_num += 1
+
+            print(str(self.sample_vox_size)+" Epoch: [%2d/%2d] time: %4.4f, loss_sp: %.6f, loss_total: %.6f" % (epoch, training_epoch, time.time() - start_time, avg_loss_sp/avg_num, avg_loss_tt/avg_num))
+            if epoch%10==9:
+                self.test_1(config,"train_"+str(self.sample_vox_size)+"_"+str(epoch))
+            if epoch%20==19:
+                # self.save(epoch)
+                pass
+
+        # self.save(training_epoch)
+ 
 
     def train(self, config):
         #load previous checkpoint
