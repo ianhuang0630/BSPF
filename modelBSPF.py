@@ -21,7 +21,10 @@ from BSPF import bspf_network
 from utils import *
 
 #pytorch 1.2.0 implementation
-
+USEWANDB = True
+if USEWANDB:
+    import wandb
+    wandb.init(project="vr-clay", entity="ianhuang")
 
 class generator(nn.Module):
     def __init__(self, phase, p_dim, c_dim):
@@ -221,7 +224,7 @@ class BSP_AE(object):
         self.c_dim = 256
 
         self.dataset_name = config.dataset
-        self.dataset_load = self.dataset_name + '_test' # '_train'
+        self.dataset_load = self.dataset_name + '_train'
         if not (config.train or config.getz):
             self.dataset_load = self.dataset_name + '_test'
         self.checkpoint_dir = config.checkpoint_dir
@@ -248,7 +251,7 @@ class BSP_AE(object):
         # generate pairs
         src_idx = [ idx for idx in range(len(data_id)) if retain_airplanes(*data_id[idx])] 
         tgt_idx = get_airplanes_targets(src_idx)
-        first_k = 24 
+        first_k = None
         if first_k is not None:
             self.src_tgt = list(zip(src_idx[:first_k], tgt_idx[:first_k]))
         else: 
@@ -476,6 +479,8 @@ class BSP_AE(object):
                     tgt_errSP, tgt_errTT = self.loss(tgt_net_out_convexes, tgt_net_out, tgt_point_value, self.bsp_network.generator.convex_layer_weights, self.bsp_network.generator.concave_layer_weights)
                     src_errSP, src_errTT = self.loss(src_net_out_convexes, src_net_out, tgt_point_value, self.bsp_network.generator.convex_layer_weights, self.bsp_network.generator.concave_layer_weights)
                 print(f'loss: {errTT.detach().item()}     src_ref: {src_errTT.detach().item()}      tgt_ref: {tgt_errTT.detach().item()}')
+                if USEWANDB: wandb.log({'loss': errTT.detach().item(), 'src_ref': src_errTT.detach().item(), 'tgt_ref': tgt_errTT.detach().item()}) 
+
                 self.bsp_network.zero_grad()
                 self.bspf_network.zero_grad()
                 errTT.backward() # NOTE gradients also calculated for the generator. this is slower, and useless.
