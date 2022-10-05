@@ -21,7 +21,7 @@ from BSPF import bspf_network
 from utils import *
 
 #pytorch 1.2.0 implementation
-USEWANDB = True
+USEWANDB = False
 if USEWANDB:
     import wandb
     wandb.init(project="vr-clay", entity="ianhuang")
@@ -224,8 +224,9 @@ class BSP_AE(object):
         self.c_dim = 256
 
         self.dataset_name = config.dataset
-        self.dataset_load = self.dataset_name + '_train'
-        if not (config.train or config.getz):
+        if config.dataset_partition== 'train':
+            self.dataset_load = self.dataset_name + '_train'
+        else:
             self.dataset_load = self.dataset_name + '_test'
         self.checkpoint_dir = config.checkpoint_dir
         self.data_dir = config.data_dir
@@ -314,6 +315,7 @@ class BSP_AE(object):
         self.max_to_keep = 2
         self.checkpoint_path = os.path.join(self.checkpoint_dir, self.model_dir)
         self.checkpoint_name='BSP_AE.model'
+        self.bspf_checkpoint_name='BSPF.model'
         self.checkpoint_manager_list = [None] * self.max_to_keep
         self.checkpoint_manager_pointer = 0
         #loss
@@ -373,6 +375,18 @@ class BSP_AE(object):
     def model_dir(self):
         return "{}_ae_{}".format(self.dataset_name, self.input_size)
 
+    def loadf(self):
+        checkpoint_name = sorted([((int(el[:-len('.pth')].split('-')[1]), int(el[:-len('.pth')].split('-')[2])), el) for el in os.listdir(self.checkpoint_path) if el.endswith('.pth') and el.startswith('BSPF')],
+                                 key= lambda x : x[0], reverse=True)[0][1]
+        checkpoint_name = os.path.join(self.checkpoint_path, checkpoint_name)
+        if os.path.exists(checkpoint_name):
+            self.bspf_network.load_state_dict(torch.load(checkpoint_name))
+            print(" [*] Flow Model Load SUCCESS")
+            return True
+        else:
+            print(" [!] Flow model Load Failed.")
+            return False
+
     def load(self):
         #load previous checkpoint
         checkpoint_txt = os.path.join(self.checkpoint_path, "checkpoint")
@@ -391,6 +405,7 @@ class BSP_AE(object):
         if not os.path.exists(self.checkpoint_path):
             os.makedirs(self.checkpoint_path)
         save_dir = os.path.join(self.checkpoint_path,self.checkpoint_name+str(self.sample_vox_size)+"-"+str(self.phase)+"-"+str(epoch)+".pth")
+        bspf_save_dir = os.path.join(self.checkpoint_path,self.bspf_checkpoint_name+str(self.sample_vox_size)+"-"+str(self.phase)+"-"+str(epoch)+".pth")
         self.checkpoint_manager_pointer = (self.checkpoint_manager_pointer+1)%self.max_to_keep
         #delete checkpoint
         if self.checkpoint_manager_list[self.checkpoint_manager_pointer] is not None:
@@ -398,6 +413,7 @@ class BSP_AE(object):
                 os.remove(self.checkpoint_manager_list[self.checkpoint_manager_pointer])
         #save checkpoint
         torch.save(self.bsp_network.state_dict(), save_dir)
+        torch.save(self.bspf_network.state_dict(), bspf_save_dir)
         #update checkpoint manager
         self.checkpoint_manager_list[self.checkpoint_manager_pointer] = save_dir
         #write file
@@ -409,8 +425,127 @@ class BSP_AE(object):
                 fout.write(self.checkpoint_manager_list[pointer]+"\n")
         fout.close()
 
+    def get_convex_list(self, occupancies, plane_parameters, post_processing_flag=False):
+        bsp_convex_list = []
+        occupancies = occupancies<0.01
+        occupancies_sum = np.sum(occupancies,axis=3)
+        color_index_list = []
+
+        w2 = self.bsp_network.generator.convex_layer_weights.detach().cpu().numpy()
+
+        for i in range(self.c_dim): # iterating through the convexes
+            slice_i = occupancies[:,:,:,i] # isolating occupancies to the convex in question.
+            if np.max(slice_i)>0: #if one voxel is inside a convex
+                if post_processing_flag and np.min(occupancies_sum-slice_i*2)>=0: #if this convex is redundant, i.e. the convex is inside the shape
+                    occupancies_sum = occupancies_sum-slice_i
+                else:
+                    box = []
+                    for j in range(self.p_dim):
+                        if w2[j,i]>0.01:
+                            a = -plane_parameters[0,0,j]
+                            b = -plane_parameters[0,1,j]
+                            c = -plane_parameters[0,2,j]
+                            d = -plane_parameters[0,3,j]
+                            box.append([a,b,c,d])
+                    if len(box)>0:
+                        bsp_convex_list.append(np.array(box,np.float32))
+                        color_index_list.append(i)
+        
+        return bsp_convex_list , color_index_list
+
+    @staticmethod
+    def export2obj(path, convex_list, color_idx):
+        fout2 = open(path, 'w')
+        fout2.write("mtllib default.mtl\n")
+        vertices = []
+        for i in range(len(convex_list)):
+            vg, tg = get_mesh([convex_list[i]])
+            vbias=len(vertices)+1
+            vertices = vertices+vg
+            fout2.write("usemtl m"+str(color_idx[i]+1)+"\n")
+            for ii in range(len(vg)):
+                fout2.write("v "+str(vg[ii][0])+" "+str(vg[ii][1])+" "+str(vg[ii][2])+"\n")
+            for ii in range(len(tg)):
+                fout2.write("f")
+                for jj in range(len(tg[ii])):
+                    fout2.write(" "+str(tg[ii][jj]+vbias))
+                fout2.write("\n")
+        fout2.close()
+
+    
+    def get_mesh(self, src_idx, tgt_idx, output_dir, output_prefix):
+        """
+        idx indexes into self.src_tgt to access a specific training source-target pair
+        """
+
+        # setting both models to eval mode
+        self.bsp_network.eval()
+        self.bspf_network.eval()
+
+        src_batch_voxels = self.data_voxels[src_idx].astype(np.float32)
+        tgt_batch_voxels = self.data_voxels[tgt_idx].astype(np.float32) 
+        src_point_coord = self.data_points[src_idx]
+        tgt_point_coord = self.data_points[tgt_idx]
+        src_batch_voxels = torch.from_numpy(src_batch_voxels).unsqueeze(0).to(self.device) # creating pseudo batch dimension
+        tgt_batch_voxels = torch.from_numpy(tgt_batch_voxels).unsqueeze(0).to(self.device) # creating pseudo batch dimension
+        src_point_coord = torch.from_numpy(src_point_coord).unsqueeze(0).to(self.device)
+        tgt_point_coord = torch.from_numpy(tgt_point_coord).unsqueeze(0).to(self.device)
+
+        dima = self.test_size
+        dim = self.real_size
+        multiplier = int(dim/dima)
+        multiplier2 = multiplier*multiplier
+
+        with torch.no_grad():
+            src_z, src_out_m, src_out,_ = self.bsp_network(src_batch_voxels, None, None, src_point_coord, is_training=False)
+            tgt_z, tgt_out_m, tgt_out,_ = self.bsp_network(tgt_batch_voxels, None, None, tgt_point_coord, is_training=False)
+
+            # predictions
+            pred_planes = self.bspf_network(tgt_z, src_z, src_out_m)
+            
+            src_model_float = np.ones([self.real_size,self.real_size,self.real_size,self.c_dim],np.float32)
+            tgt_model_float = np.ones([self.real_size,self.real_size,self.real_size,self.c_dim],np.float32)
+            pred_model_float = np.ones([self.real_size,self.real_size,self.real_size,self.c_dim],np.float32)
+            for i in range(multiplier):
+                for j in range(multiplier):
+                    for k in range(multiplier):
+                        minib = i*multiplier2+j*multiplier+k
+                        point_coord = self.coords[minib:minib+1]
+                        _,_, src_model_out, _ = self.bsp_network(None, None, src_out_m, point_coord, is_training=False)
+                        src_model_float[self.aux_x+i,self.aux_y+j,self.aux_z+k,:] = np.reshape(src_model_out.detach().cpu().numpy(), [self.test_size,self.test_size,self.test_size,self.c_dim])
+                        _,_, tgt_model_out, _ = self.bsp_network(None, None, tgt_out_m, point_coord, is_training=False)
+                        tgt_model_float[self.aux_x+i,self.aux_y+j,self.aux_z+k,:] = np.reshape(tgt_model_out.detach().cpu().numpy(), [self.test_size,self.test_size,self.test_size,self.c_dim])
+                        _,_, pred_model_out, _ = self.bsp_network(None, None, pred_planes, point_coord, is_training=False)
+                        pred_model_float[self.aux_x+i,self.aux_y+j,self.aux_z+k,:] = np.reshape(pred_model_out.detach().cpu().numpy(), [self.test_size,self.test_size,self.test_size,self.c_dim])
+
+            src_bsp_convex_list, src_color_index = self.get_convex_list(src_model_float, src_out_m.detach().cpu().numpy())
+            tgt_bsp_convex_list, tgt_color_index = self.get_convex_list(tgt_model_float, tgt_out_m.detach().cpu().numpy())
+            pred_bsp_convex_list, pred_color_index = self.get_convex_list(pred_model_float, pred_planes.detach().cpu().numpy())
+
+        # EXPORT SOURCE (with colors)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        BSP_AE.export2obj(os.path.join(output_dir, f'{output_prefix}_tgt.obj'), tgt_bsp_convex_list, tgt_color_index)
+        BSP_AE.export2obj(os.path.join(output_dir, f'{output_prefix}_src.obj'), src_bsp_convex_list, src_color_index)
+        BSP_AE.export2obj(os.path.join(output_dir, f'{output_prefix}_pred.obj'), pred_bsp_convex_list, pred_color_index)
+
+    def visualize(self, config):
+        self.load()
+        self.loadf()
+        output_dir = 'samples_viz'
+        shape_num = len(self.src_tgt)
+        for idx in range(shape_num):
+            print(f'{idx+1}/{shape_num}:  {os.path.join(output_dir, str(idx))}...etc')
+            src_idx, tgt_idx = self.src_tgt[idx]
+            try:
+                self.get_mesh(src_idx, tgt_idx, output_dir=output_dir, output_prefix=str(idx))
+            except:
+                print("Error!")
+
     def train_BSPF(self, config):
         self.load() # loading the  parameters for the BSP network.
+        # self.loadf() # loading the  parameters for the BSPF network
         shape_num = len(self.src_tgt)
         print("\n\n----------net summary----------")
         print("training samples   ", shape_num)
@@ -494,10 +629,9 @@ class BSP_AE(object):
             if epoch%10==9:
                 self.test_1(config,"train_"+str(self.sample_vox_size)+"_"+str(epoch))
             if epoch%20==19:
-                # self.save(epoch)
-                pass
-
-        # self.save(training_epoch)
+                self.save(epoch)
+        
+        self.save(training_epoch)
  
 
     def train(self, config):
