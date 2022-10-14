@@ -21,6 +21,7 @@ parser.add_argument("--learning_rate", action="store", dest="learning_rate", def
 parser.add_argument("--beta1", action="store", dest="beta1", default=0.5, type=float, help="Momentum term of adam [0.5]")
 parser.add_argument("--dataset", action="store", dest="dataset", default="all_vox256_img", help="The name of dataset")
 parser.add_argument("--dataset_partition", action="store", dest="dataset_partition", default="test", help="Either test or train")
+parser.add_argument("--bspf_name", action="store", dest="bspf_name", required=True)
 parser.add_argument("--checkpoint_dir", action="store", dest="checkpoint_dir", default="checkpoint", help="Directory name to save the checkpoints [checkpoint]")
 parser.add_argument("--data_dir", action="store", dest="data_dir", default="./data/all_vox256_img/", help="Root directory of dataset [data]")
 parser.add_argument("--sample_dir", action="store", dest="sample_dir", default="./samples/", help="Directory name to save the image samples [samples]")
@@ -32,6 +33,7 @@ parser.add_argument("--ae", action="store_true", dest="ae", default=False, help=
 parser.add_argument("--svr", action="store_true", dest="svr", default=False, help="True for svr [False]")
 parser.add_argument("--getz", action="store_true", dest="getz", default=False, help="True for getting latent codes [False]")
 parser.add_argument("--gpu", action="store", dest="gpu", default="0", help="Which GPU to use [0]")
+parser.add_argument("--use_wandb", action="store_true", dest="use_wandb", default=False)
 FLAGS = parser.parse_args()
 
 

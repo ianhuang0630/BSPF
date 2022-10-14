@@ -21,10 +21,9 @@ from BSPF import bspf_network
 from utils import *
 
 #pytorch 1.2.0 implementation
-USEWANDB = False
-if USEWANDB:
-    import wandb
-    wandb.init(project="vr-clay", entity="ianhuang")
+PROJECT = "vr-clay"
+USER = "ianhuang"
+
 
 class generator(nn.Module):
     def __init__(self, phase, p_dim, c_dim):
@@ -202,6 +201,11 @@ class BSP_AE(object):
         Args:
             too lazy to explain
         """
+        self.config = config 
+        if config.use_wandb:
+            import wandb
+            wandb.init(project="vr-clay", entity="ianhuang")
+
         self.phase = config.phase
 
         #progressive training
@@ -314,6 +318,7 @@ class BSP_AE(object):
         #have to define it myself to manage max num of checkpoints to keep
         self.max_to_keep = 2
         self.checkpoint_path = os.path.join(self.checkpoint_dir, self.model_dir)
+        self.bspf_checkpoint_path = os.path.join(self.checkpoint_dir, config.bspf_name)
         self.checkpoint_name='BSP_AE.model'
         self.bspf_checkpoint_name='BSPF.model'
         self.checkpoint_manager_list = [None] * self.max_to_keep
@@ -376,9 +381,9 @@ class BSP_AE(object):
         return "{}_ae_{}".format(self.dataset_name, self.input_size)
 
     def loadf(self):
-        checkpoint_name = sorted([((int(el[:-len('.pth')].split('-')[1]), int(el[:-len('.pth')].split('-')[2])), el) for el in os.listdir(self.checkpoint_path) if el.endswith('.pth') and el.startswith('BSPF')],
+        checkpoint_name = sorted([((int(el[:-len('.pth')].split('-')[1]), int(el[:-len('.pth')].split('-')[2])), el) for el in os.listdir(self.bspf_checkpoint_path) if el.endswith('.pth') and el.startswith('BSPF')],
                                  key= lambda x : x[0], reverse=True)[0][1]
-        checkpoint_name = os.path.join(self.checkpoint_path, checkpoint_name)
+        checkpoint_name = os.path.join(self.bspf_checkpoint_path, checkpoint_name)
         if os.path.exists(checkpoint_name):
             self.bspf_network.load_state_dict(torch.load(checkpoint_name))
             print(" [*] Flow Model Load SUCCESS")
@@ -405,7 +410,9 @@ class BSP_AE(object):
         if not os.path.exists(self.checkpoint_path):
             os.makedirs(self.checkpoint_path)
         save_dir = os.path.join(self.checkpoint_path,self.checkpoint_name+str(self.sample_vox_size)+"-"+str(self.phase)+"-"+str(epoch)+".pth")
-        bspf_save_dir = os.path.join(self.checkpoint_path,self.bspf_checkpoint_name+str(self.sample_vox_size)+"-"+str(self.phase)+"-"+str(epoch)+".pth")
+        bspf_save_dir = os.path.join(self.bspf_checkpoint_path,self.bspf_checkpoint_name+str(self.sample_vox_size)+"-"+str(self.phase)+"-"+str(epoch)+".pth")
+        if not os.path.exists(self.bspf_checkpoint_path):
+            os.makedirs(self.bspf_checkpoint_path)
         self.checkpoint_manager_pointer = (self.checkpoint_manager_pointer+1)%self.max_to_keep
         #delete checkpoint
         if self.checkpoint_manager_list[self.checkpoint_manager_pointer] is not None:
@@ -605,22 +612,39 @@ class BSP_AE(object):
                     # NOTE: for source, querying the tgt point coordinates. This should affect net_out_convexes and net_out, but not src_latent and src_planes.
                     src_latent, src_planes, src_net_out_convexes, src_net_out = self.bsp_network(src_batch_voxels, None, None, tgt_point_coord, is_training=False) # NOTE is_training = TRUE?
                     tgt_latent, tgt_planes, tgt_net_out_convexes, tgt_net_out = self.bsp_network(tgt_batch_voxels, None, None, tgt_point_coord, is_training=False)  
+                    _, _, s_flowed_net_out_convexes, s_flowed_net_out = self.bsp_network(None, None, tgt_planes, src_point_coord, convex_mask=None, is_training=False)
 
                 pred_planes = self.bspf_network(tgt_latent, src_latent, src_planes)
                 _, _, flowed_net_out_convexes, flowed_net_out = self.bsp_network(None, None, pred_planes, tgt_point_coord, convex_mask=None, is_training=False)
+
+                # pass the source points through the pretrained target generator
+                _, _, s_pred_flowed_net_out_convexes, s_pred_flowed_net_out = self.bsp_network(None, None, pred_planes, src_point_coord, convex_mask=None, is_training=False)
+
                 # NOTE; by default, this is phase=1 loss function (hard discretization, L_recon)
-                errSP, errTT = self.loss(flowed_net_out_convexes, flowed_net_out, tgt_point_value, self.bsp_network.generator.convex_layer_weights, self.bsp_network.generator.concave_layer_weights)
+                errSP, errTT = self.loss(flowed_net_out_convexes, flowed_net_out, 
+                                            tgt_point_value, 
+                                            self.bsp_network.generator.convex_layer_weights, 
+                                            self.bsp_network.generator.concave_layer_weights)
+                serrSP, serrTT = self.loss(s_pred_flowed_net_out_convexes, s_pred_flowed_net_out, 
+                                            1 - torch.clamp(s_flowed_net_out, min=0.0, max=1.0),  # 1 -    because of the nature of the loss function definition
+                                            self.bsp_network.generator.convex_layer_weights, 
+                                            self.bsp_network.generator.concave_layer_weights)
                 with torch.no_grad():
                     tgt_errSP, tgt_errTT = self.loss(tgt_net_out_convexes, tgt_net_out, tgt_point_value, self.bsp_network.generator.convex_layer_weights, self.bsp_network.generator.concave_layer_weights)
                     src_errSP, src_errTT = self.loss(src_net_out_convexes, src_net_out, tgt_point_value, self.bsp_network.generator.convex_layer_weights, self.bsp_network.generator.concave_layer_weights)
                 print(f'loss: {errTT.detach().item()}     src_ref: {src_errTT.detach().item()}      tgt_ref: {tgt_errTT.detach().item()}')
-                if USEWANDB: wandb.log({'loss': errTT.detach().item(), 'src_ref': src_errTT.detach().item(), 'tgt_ref': tgt_errTT.detach().item()}) 
+                # TODO: also ADD LOSS related to source points within the TARGET plane predictions! 
 
                 self.bsp_network.zero_grad()
                 self.bspf_network.zero_grad()
-                errTT.backward() # NOTE gradients also calculated for the generator. this is slower, and useless.
+                parametric_loss = torch.mean(torch.norm(tgt_planes - pred_planes, dim=1))
+                # parametric_loss.backward()
+                (errTT + serrTT).backward() # NOTE gradients also calculated for the generator. this is slower, and useless.
+                #  (50*errTT + parametric_loss).backward()
+                # parametric_loss.backward()
                 self.bspf_optimizer.step()  # NOTE: we only take the step in bspf
 
+                if self.config.use_wandb: wandb.log({'loss': errTT.detach().item(), 'src2tgt': serrTT.detach().item(), 'src_ref': src_errTT.detach().item(), 'tgt_ref': tgt_errTT.detach().item(), 'param_loss': parametric_loss.detach().item()}) 
                 avg_loss_sp += errSP.item()
                 avg_loss_tt += errTT.item()
                 avg_num += 1

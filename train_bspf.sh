@@ -8,4 +8,6 @@ python mainBSPF.py \
   --train \
   --iteration 16000000 \
   --learning_rate 0.001 \
-  --dataset_partition train
+  --dataset_partition train \
+  --bspf_name "shiftrestrict_negsrc2" \
+  --use_wandb

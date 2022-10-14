@@ -5,4 +5,5 @@ python mainBSPF.py \
   --start 0 \
   --end 9000 \
   --data_dir ../NTMorph/data/all_vox256_img/ \
+  --bspf_name "shiftrestrict_negsrc" \
   --dataset_partition train

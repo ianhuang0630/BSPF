@@ -28,7 +28,68 @@ class bspf_network_vanilla(nn.Module):
         # needs to be output 
         # batchsize x num_planes x 4
 
+
 class bspf_network(nn.Module):
+    """
+    This implementation uses a transformer, and treats the planes like a sequence of tokens.
+    This should in theory be equivalent to a dense graph neural network.
+    """
+    def __init__(self, embedding_size, num_planes):
+        super().__init__()
+        
+        self.embedding_size = embedding_size
+        self.num_planes = num_planes
+
+        self.z_size = 128  # TODO load from hyperparameters
+        self.hidden_dims = 128
+        self.nheads = 1
+        self.dropout = 0.0
+        self.nlayers = 1
+        self.primitive_params = 4 
+
+        self.feature_extractor = nn.Linear(embedding_size*2, self.z_size) # [batch  x (2*embedding_size)]  --> [batch x z_size]
+        self.transformer = MyTransformerEncoder(self.z_size + self.primitive_params, 
+                                                self.hidden_dims, self.nheads, 
+                                                self.dropout, self.nlayers)
+        self.flow = nn.Linear(self.z_size + self.primitive_params, 1) # [batch x z_size] --> [batch x num_planes x 1] 
+
+
+        nn.init.constant_(self.flow.weight, 0)
+        nn.init.constant_(self.flow.bias, 0)
+
+
+
+    def extract_features(self, tgt_z, src_z, src_planes):
+        """
+        for extracting the feature uesd to create the flow field.
+        src_planes: (batch_size,  num_planes, parameters)
+        """
+        feat = self.feature_extractor(torch.cat([tgt_z,src_z], dim=1)) # batchsize * z_size
+        # put into transformer now
+        feat = torch.cat([feat.unsqueeze(1).repeat(1, self.num_planes, 1),
+                          src_planes], dim=-1) # batchsize x numplanes x [feat_size]
+        
+        # the sequence goes : numplanes x batchsize x [feat_size]
+        out = self.transformer(feat.transpose(0,1)).transpose(0,1)
+        return out
+
+    def forward(self, tgt_z, src_z, src_planes):
+        """
+        src_planes: (batch_size, parameters, num_planes)
+        """
+        src_planes = src_planes.transpose(1,2) # ->  batchsize, num_planes, parameters
+        feat = self.extract_features(tgt_z, src_z, src_planes)
+        # feat = torch.cat([feat.reshape(-1, feat.shape[-1]), src_planes.transpose(1,2).reshape(-1, self.primitive_params)], dim=-1)
+        out = self.flow(feat.reshape(-1, feat.shape[-1])).reshape(feat.shape[0], feat.shape[1], -1) 
+        # tile so that it's (batch * self.num_planes,  zsize) (duplicate across the number of planes)
+        out = out.transpose(1,2) # -> batchsize, 1, num_planes
+
+        out = torch.cat((torch.zeros(out.shape[0], 3, out.shape[2]).to(out.device), out), dim=1)  # -> batchsize , 4, num_planes
+        # now regress.  NOTE: single step for now.
+        out = src_planes.transpose(1,2) + out
+        return out
+
+class bspf_network_transformer(nn.Module):
     """
     This implementation uses a transformer, and treats the planes like a sequence of tokens.
     This should in theory be equivalent to a dense graph neural network.
